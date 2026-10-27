@@ -1,11 +1,14 @@
 # FRDM-MCXA153 blinky + serial shell
 
 Bare-metal firmware for the NXP FRDM-MCXA153 board: RGB LED control, a
-serial command shell, a PWM output on P1_4 (J1-2), and settings saved to flash.
+serial command shell, two independent PWM outputs (P1_4 on J1-2 and P1_3), and
+settings saved to flash.
 
-Used for BAM 1 v5 regression (CY26 Q4 Goal 2): the PWM output drives a
-4-20 mA module wired to the BAM pressure input, so test scripts can send a
-pressure reading with `ma <mA>` and check what the BAM reports. Owner: Ed
+Used for BAM 1 v5 regression (CY26 Q4 Goal 2): each PWM output drives a
+4-20 mA module wired to a BAM pressure input, so test scripts can send a
+pressure reading with `ma <mA>` (channel 1) or `ma2 <mA>` (channel 2) and
+check what the BAM reports. Both channels run at the same time with their own
+setpoints. Owner: Ed
 (requested the project); built by Dom.
 
 ## Make commands
@@ -66,12 +69,32 @@ picocom -b 115200 /dev/ttyACM0      # exit: Ctrl-A then Ctrl-X
 | `cal lo <mA>` | Record the meter reading at the present output (do this near 4 mA) |
 | `cal hi <mA>` | Record the meter reading at the present output (do this near 20 mA) |
 | `cal reset` | Back to 0 counts = 4 mA, 1000 counts = 20 mA |
-| `save` | Store current settings, including calibration, in flash (kept over power-off) |
+| `pwm2`, `ma2`, `cal2` ... | Same commands for channel 2 (P1_3), e.g. `ma2 8`, `cal2 lo 3.95`. `pwm1`/`ma1`/`cal1` also work for channel 1 |
+| `save` | Store current settings, including both channels' calibration, in flash (kept over power-off) |
 | `defaults` | Erase saved settings, restore defaults |
 | `status` | Show current state |
 | `reset` | Reboot the chip |
 
-## 4-20 mA output (NOYITO voltage-to-current module)
+## 4-20 mA outputs (NOYITO voltage-to-current modules)
+
+There are two channels, each wired to its own module exactly as below:
+
+| Channel | PWM pin | Commands |
+|---|---|---|
+| 1 | P1_4 (J1-2), CTIMER1 match 2 | `pwm`, `ma`, `cal` |
+| 2 | P1_3, CTIMER1 match 1 | `pwm2`, `ma2`, `cal2` |
+
+P1_3 is on the Arduino-style header (it is the LPSPI0 PCS0 pin); check the
+FRDM-MCXA153 schematic or silkscreen for the exact header position. Both
+channels share the 12 kHz period, but each has its own duty cycle.
+
+Each module needs its own RC filter and its own calibration (steps below,
+using `ma2`/`cal2` for channel 2). One 12-24 V supply can power both. The
+module's VIN- and 0V are common, so both loops' 0V end up tied to FRDM GND:
+that is fine when both BAM inputs return to the same supply negative, but
+not if the BAM inputs are isolated from each other.
+
+Per module:
 
 The module has two terminal blocks:
 
@@ -112,11 +135,14 @@ Resolution is about 16 µA per count (1000 counts over 4-20 mA).
 
 - Connect the board to the Pi with the USB-C port labelled **MCU-Link** (J15).
 - RGB LED: red P3_12, green P3_13, blue P3_0 (active low).
-- PWM: P1_4 on header J1 pin 2, 12 kHz, 1000 counts per period. Add an RC
-  low-pass filter (for example 10 kΩ + 1 µF) to get 0 to 3.3 V.
+- PWM: channel 1 on P1_4 (header J1 pin 2), channel 2 on P1_3, 12 kHz,
+  1000 counts per period. Add an RC low-pass filter (for example 10 kΩ +
+  1 µF) to each to get 0 to 3.3 V.
 - Core clock: 48 MHz (FIRC, as left by the boot ROM).
 - Saved settings live in the last 8 KB flash sector (0x1E000). `make flash`
-  does not erase it.
+  does not erase it. Settings saved by the older single-channel firmware are
+  still read (as channel 1); the first `save` rewrites the sector in the
+  two-channel format.
 
 ## One-time setup (already done on this Pi)
 
