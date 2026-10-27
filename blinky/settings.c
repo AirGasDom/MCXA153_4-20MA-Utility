@@ -53,25 +53,49 @@ typedef struct
 #define FLASH_API     (ROM_API->flash_driver)
 #define FLASH_ERASE_KEY 0x6B65666CU /* 'lfek' */
 
-/* On-flash record: three 16-byte phrases. */
+/* On-flash record: four 16-byte phrases. */
 typedef struct
 {
     uint32_t magic;
     uint32_t version;
     settings_t s;
-    uint32_t reserved;
     uint32_t crc;
 } record_t;
 
 _Static_assert(sizeof(record_t) == SETTINGS_RECORD, "record size must match SETTINGS_RECORD");
 
-#define RECORD_MAGIC   0x5358434DU /* "MCXS" */
-#define RECORD_VERSION 2U /* v2 adds calibration */
-#define ERASED_WORD    0xFFFFFFFFU
-
-static const volatile record_t *slot(uint32_t i)
+/* Single-channel record written by older firmware (three phrases). Only
+ * read, so a saved calibration carries over to channel 1; the next save
+ * erases the sector and starts over with v3 records. */
+typedef struct
 {
-    return (const volatile record_t *)(SETTINGS_ADDR + i * SETTINGS_RECORD);
+    uint32_t magic;
+    uint32_t version;
+    uint32_t mode;
+    uint32_t color;
+    uint32_t period_ms;
+    settings_channel_t ch0;
+    uint32_t reserved;
+    uint32_t crc;
+} record_v2_t;
+
+_Static_assert(sizeof(record_v2_t) == 48U, "v2 record is 48 bytes");
+
+#define RECORD_MAGIC      0x5358434DU /* "MCXS" */
+#define RECORD_VERSION    3U /* v3 adds the second output channel */
+#define RECORD_VERSION_V2 2U /* v2 adds calibration */
+#define ERASED_WORD       0xFFFFFFFFU
+
+static const volatile uint32_t *slot(uint32_t stride, uint32_t i)
+{
+    return (const volatile uint32_t *)(SETTINGS_ADDR + i * stride);
+}
+
+/* Record size used by what is in the sector: 48 for v2, else 64. */
+static uint32_t sector_stride(void)
+{
+    const volatile uint32_t *w = slot(SETTINGS_RECORD, 0);
+    return (w[0] == RECORD_MAGIC && w[1] == RECORD_VERSION_V2) ? sizeof(record_v2_t) : SETTINGS_RECORD;
 }
 
 static uint32_t crc32(const void *data, uint32_t len)
@@ -89,10 +113,11 @@ static uint32_t crc32(const void *data, uint32_t len)
     return ~crc;
 }
 
-static bool record_valid(const record_t *r)
+/* Both layouts start with magic, version and end with a CRC of the rest. */
+static bool record_valid(const void *r, uint32_t size, uint32_t version)
 {
-    return r->magic == RECORD_MAGIC && r->version == RECORD_VERSION &&
-           r->crc == crc32(r, offsetof(record_t, crc));
+    const uint32_t *w = r;
+    return w[0] == RECORD_MAGIC && w[1] == version && w[size / 4U - 1U] == crc32(r, size - 4U);
 }
 
 /* After erasing or programming, drop stale flash data from the LPCAC and
@@ -145,26 +170,50 @@ static status_t flash_open(flash_config_t *cfg)
     return FLASH_API->flash_init(cfg);
 }
 
-uint32_t settings_used_slots(void)
+static uint32_t used_slots(uint32_t stride)
 {
     uint32_t i = 0;
-    while (i < SETTINGS_SLOTS && slot(i)->magic != ERASED_WORD)
+    while (i < SETTINGS_SIZE / stride && slot(stride, i)[0] != ERASED_WORD)
     {
         i++;
     }
     return i;
 }
 
+uint32_t settings_used_slots(void)
+{
+    return used_slots(sector_stride());
+}
+
 bool settings_load(settings_t *out)
 {
-    for (uint32_t i = settings_used_slots(); i > 0U; i--)
+    uint32_t stride = sector_stride();
+
+    for (uint32_t i = used_slots(stride); i > 0U; i--)
     {
-        record_t r;
-        memcpy(&r, (const void *)slot(i - 1U), sizeof(r));
-        if (record_valid(&r))
+        const void *src = (const void *)slot(stride, i - 1U);
+        if (stride == SETTINGS_RECORD)
         {
-            *out = r.s;
-            return true;
+            record_t r;
+            memcpy(&r, src, sizeof(r));
+            if (record_valid(&r, sizeof(r), RECORD_VERSION))
+            {
+                *out = r.s;
+                return true;
+            }
+        }
+        else
+        {
+            record_v2_t r;
+            memcpy(&r, src, sizeof(r));
+            if (record_valid(&r, sizeof(r), RECORD_VERSION_V2))
+            {
+                out->mode      = r.mode;
+                out->color     = r.color;
+                out->period_ms = r.period_ms;
+                out->ch[0]     = r.ch0;
+                return true;
+            }
         }
     }
     return false;
@@ -179,8 +228,11 @@ int32_t settings_save(const settings_t *s)
         return st;
     }
 
-    uint32_t i = settings_used_slots();
-    if (i >= SETTINGS_SLOTS)
+    /* Start a fresh sector when it is full or holds another record layout
+     * (records of different sizes can't share it). */
+    const volatile uint32_t *first = slot(SETTINGS_RECORD, 0);
+    uint32_t i = used_slots(SETTINGS_RECORD);
+    if (i >= SETTINGS_SLOTS || (first[0] != ERASED_WORD && first[1] != RECORD_VERSION))
     {
         st = do_erase(&cfg);
         if (st != 0)
@@ -191,10 +243,9 @@ int32_t settings_save(const settings_t *s)
     }
 
     record_t r = {
-        .magic    = RECORD_MAGIC,
-        .version  = RECORD_VERSION,
-        .s        = *s,
-        .reserved = ERASED_WORD,
+        .magic   = RECORD_MAGIC,
+        .version = RECORD_VERSION,
+        .s       = *s,
     };
     r.crc = crc32(&r, offsetof(record_t, crc));
 
@@ -206,7 +257,7 @@ int32_t settings_save(const settings_t *s)
 
     /* Read back through the bus to confirm. */
     record_t check;
-    memcpy(&check, (const void *)slot(i), sizeof(check));
+    memcpy(&check, (const void *)slot(SETTINGS_RECORD, i), sizeof(check));
     return memcmp(&check, &r, sizeof(r)) == 0 ? 0 : -1;
 }
 

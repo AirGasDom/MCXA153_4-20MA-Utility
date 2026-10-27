@@ -10,12 +10,17 @@
  * MCU-Link bridges to the host as a USB CDC port (/dev/ttyACM0 on Linux).
  * 115200 8N1. Type "help" for commands.
  *
- * PWM on P1_4 (header J1-2) from CTIMER1 match 2, 12 kHz, 1000 counts/period.
- * Add an RC low-pass (e.g. 10k + 1uF) to get an analog voltage of
+ * Two PWM outputs from CTIMER1, 12 kHz, 1000 counts/period:
+ *   channel 1 = P1_4 (header J1-2), match 2
+ *   channel 2 = P1_3, match 1
+ * They share the period (MR3) but each has its own match register, so the
+ * duty cycles are set independently and both run at the same time.
+ * Add an RC low-pass (e.g. 10k + 1uF) to each to get an analog voltage of
  * VDD * high_counts / 1000.
  *
- * "ma" drives a 0-3.3 V to 4-20 mA module from the filtered PWM. A two-point
- * calibration ("cal lo/hi <measured mA>") maps PWM counts to loop current.
+ * "ma" / "ma2" drive a 0-3.3 V to 4-20 mA module from each filtered PWM. A
+ * two-point calibration per channel ("cal lo/hi <measured mA>", "cal2 ...")
+ * maps PWM counts to loop current.
  *
  * "save" stores mode/color/rate/pwm/cal in flash (see settings.c); they are
  * restored at power-up. "defaults" erases them.
@@ -47,7 +52,7 @@
 #define UART_OSR 13U
 #define UART_SBR 8U
 
-/* PWM: CTIMER1 on FRO12M, MR3 = period, MR2 = pulse (output on P1_4, ALT4). */
+/* PWM: CTIMER1 on FRO12M, MR3 = period, MR2 / MR1 = pulse (P1_4 / P1_3, ALT4). */
 #define PWM_CLK_HZ  12000000U
 #define PWM_COUNTS  1000U
 #define PWM_FREQ_HZ (PWM_CLK_HZ / PWM_COUNTS)
@@ -84,13 +89,32 @@ static uint32_t g_color      = LED_RED;
 static uint32_t g_period_ms  = 500;
 static uint32_t g_last_step;
 static uint32_t g_step;
-static uint32_t g_pwm_high;
 
-/* Two-point calibration: PWM counts -> measured loop current (uA). */
-static uint32_t g_cal_lo_counts = CAL_LO_COUNTS_DEFAULT;
-static uint32_t g_cal_lo_ua     = CAL_LO_UA_DEFAULT;
-static uint32_t g_cal_hi_counts = CAL_HI_COUNTS_DEFAULT;
-static uint32_t g_cal_hi_ua     = CAL_HI_UA_DEFAULT;
+/* One PWM output driving one 4-20 mA module. */
+typedef struct
+{
+    uint32_t mr;      /* CTIMER1 match register for the pulse */
+    const char *name; /* channel number as shown in output */
+    const char *pin;
+    uint32_t high;    /* PWM high time in counts */
+
+    /* Two-point calibration: PWM counts -> measured loop current (uA). */
+    uint32_t cal_lo_counts;
+    uint32_t cal_lo_ua;
+    uint32_t cal_hi_counts;
+    uint32_t cal_hi_ua;
+} pwm_ch_t;
+
+#define PWM_CHANNELS SETTINGS_CHANNELS
+
+#define CAL_DEFAULTS                                                                   \
+    .cal_lo_counts = CAL_LO_COUNTS_DEFAULT, .cal_lo_ua = CAL_LO_UA_DEFAULT,            \
+    .cal_hi_counts = CAL_HI_COUNTS_DEFAULT, .cal_hi_ua = CAL_HI_UA_DEFAULT
+
+static pwm_ch_t g_ch[PWM_CHANNELS] = {
+    {.mr = 2U, .name = "1", .pin = "P1_4 (J1-2)", CAL_DEFAULTS},
+    {.mr = 1U, .name = "2", .pin = "P1_3", CAL_DEFAULTS},
+};
 
 static const struct
 {
@@ -240,29 +264,34 @@ static void uart_init(void)
     NVIC_EnableIRQ(LPUART0_IRQn);
 }
 
-/* In CTIMER PWM mode the output is low from TC=0 until TC matches MR2, then
- * high until MR3 resets the counter: high time = PWM_COUNTS - MR2. */
-static void pwm_set(uint32_t high_counts)
+/* In CTIMER PWM mode the output is low from TC=0 until TC matches the
+ * channel's MRn, then high until MR3 resets the counter:
+ * high time = PWM_COUNTS - MRn. */
+static void pwm_set(pwm_ch_t *ch, uint32_t high_counts)
 {
     if (high_counts > PWM_COUNTS)
     {
         high_counts = PWM_COUNTS;
     }
-    g_pwm_high     = high_counts;
-    CTIMER1->MR[2]   = PWM_COUNTS - high_counts; /* MR2 = PWM_COUNTS never matches: 0% */
+    ch->high           = high_counts;
+    CTIMER1->MR[ch->mr] = PWM_COUNTS - high_counts; /* MRn = PWM_COUNTS never matches: 0% */
 }
 
 static void pwm_init(void)
 {
-    PORT1->PCR[4] = PORT_PCR_MUX(4); /* CT1_MAT2 */
+    PORT1->PCR[4] = PORT_PCR_MUX(4); /* CT1_MAT2, channel 1 */
+    PORT1->PCR[3] = PORT_PCR_MUX(4); /* CT1_MAT1, channel 2 */
 
     CTIMER1->TCR  = CTIMER_TCR_CRST_MASK;
     CTIMER1->PR   = 0U;
     CTIMER1->CTCR = 0U;
     CTIMER1->MCR  = CTIMER_MCR_MR3R_MASK;
     CTIMER1->MR[3] = PWM_COUNTS - 1U;
-    pwm_set(0U);
-    CTIMER1->PWMC = CTIMER_PWMC_PWMEN2_MASK;
+    for (uint32_t i = 0; i < PWM_CHANNELS; i++)
+    {
+        pwm_set(&g_ch[i], 0U);
+    }
+    CTIMER1->PWMC = CTIMER_PWMC_PWMEN2_MASK | CTIMER_PWMC_PWMEN1_MASK;
     CTIMER1->TCR  = CTIMER_TCR_CEN_MASK;
 }
 
@@ -442,6 +471,7 @@ static void cmd_help(void)
               "  cal lo <mA>        record meter reading at current output (do at ~4 mA)\n"
               "  cal hi <mA>        record meter reading at current output (do at ~20 mA)\n"
               "  cal reset          back to 0 counts=4 mA, 1000 counts=20 mA\n"
+              "  pwm/ma/cal act on channel 1 (P1_4); pwm2/ma2/cal2 on channel 2 (P1_3)\n"
               "  save               store settings in flash (kept over power-off)\n"
               "  defaults           erase saved settings, restore defaults\n"
               "  status             show current state\n"
@@ -449,8 +479,8 @@ static void cmd_help(void)
               "colors: red green blue yellow cyan magenta white off\n");
 }
 
-static void cmd_pwm_show(void);
-static void cmd_ma_show(void);
+static void cmd_pwm_show(const pwm_ch_t *ch);
+static void cmd_ma_show(const pwm_ch_t *ch);
 
 static void cmd_status(void)
 {
@@ -473,28 +503,43 @@ static void cmd_status(void)
     uart_puts(" rx_errors=");
     uart_putu(g_rx_errors);
     uart_puts("\n");
-    cmd_pwm_show();
-    cmd_ma_show();
+    for (uint32_t i = 0; i < PWM_CHANNELS; i++)
+    {
+        cmd_pwm_show(&g_ch[i]);
+        cmd_ma_show(&g_ch[i]);
+    }
 }
 
-static void cmd_pwm_show(void)
+/* "err: usage: <cmd> <rest>" so the message names pwm or pwm2 as typed. */
+static void uart_put_usage(const char *cmd, const char *rest)
 {
-    uint32_t mv = (VDD_MV * g_pwm_high + PWM_COUNTS / 2U) / PWM_COUNTS;
+    uart_puts("err: usage: ");
+    uart_puts(cmd);
+    uart_puts(rest);
+}
 
-    uart_puts("pwm: ");
-    uart_putu(g_pwm_high);
+static void cmd_pwm_show(const pwm_ch_t *ch)
+{
+    uint32_t mv = (VDD_MV * ch->high + PWM_COUNTS / 2U) / PWM_COUNTS;
+
+    uart_puts("pwm");
+    uart_puts(ch->name);
+    uart_puts(": ");
+    uart_putu(ch->high);
     uart_puts("/");
     uart_putu(PWM_COUNTS);
     uart_puts(" counts (");
-    uart_putfix(g_pwm_high * 1000U / PWM_COUNTS, 1);
+    uart_putfix(ch->high * 1000U / PWM_COUNTS, 1);
     uart_puts("%) @ ");
     uart_putu(PWM_FREQ_HZ);
     uart_puts(" Hz -> ");
     uart_putfix(mv, 3);
-    uart_puts(" V avg on P1_4 (J1-2)\n");
+    uart_puts(" V avg on ");
+    uart_puts(ch->pin);
+    uart_puts("\n");
 }
 
-static void cmd_pwm(int argc, char **argv)
+static void cmd_pwm(pwm_ch_t *ch, int argc, char **argv)
 {
     uint32_t val;
 
@@ -502,42 +547,44 @@ static void cmd_pwm(int argc, char **argv)
     {
         if (argc < 3 || !parse_u32(argv[2], &val) || val > PWM_COUNTS)
         {
-            uart_puts("err: usage: pwm counts <0..1000>\n");
+            uart_put_usage(argv[0], " counts <0..1000>\n");
             return;
         }
-        pwm_set(val);
+        pwm_set(ch, val);
     }
     else if (argc >= 2)
     {
         if (!parse_fixed(argv[1], 1, &val) || val > 1000U)
         {
-            uart_puts("err: usage: pwm <0..100> | pwm counts <0..1000>\n");
+            uart_put_usage(argv[0], " <0..100> | ");
+            uart_puts(argv[0]);
+            uart_puts(" counts <0..1000>\n");
             return;
         }
-        pwm_set((val * PWM_COUNTS + 500U) / 1000U);
+        pwm_set(ch, (val * PWM_COUNTS + 500U) / 1000U);
     }
-    cmd_pwm_show();
+    cmd_pwm_show(ch);
 }
 
 /* ------------------------------------------------------------- 4-20 mA */
 
 /* Loop current predicted from PWM counts by the calibration line. */
-static int32_t cal_counts_to_ua(uint32_t counts)
+static int32_t cal_counts_to_ua(const pwm_ch_t *ch, uint32_t counts)
 {
-    int32_t dc = (int32_t)g_cal_hi_counts - (int32_t)g_cal_lo_counts;
-    int32_t du = (int32_t)g_cal_hi_ua - (int32_t)g_cal_lo_ua;
-    int32_t c  = (int32_t)counts - (int32_t)g_cal_lo_counts;
-    return (int32_t)g_cal_lo_ua + (int32_t)(((int64_t)c * du + (dc / 2)) / dc);
+    int32_t dc = (int32_t)ch->cal_hi_counts - (int32_t)ch->cal_lo_counts;
+    int32_t du = (int32_t)ch->cal_hi_ua - (int32_t)ch->cal_lo_ua;
+    int32_t c  = (int32_t)counts - (int32_t)ch->cal_lo_counts;
+    return (int32_t)ch->cal_lo_ua + (int32_t)(((int64_t)c * du + (dc / 2)) / dc);
 }
 
 /* PWM counts needed for `ua`; false if outside 0..PWM_COUNTS. */
-static bool cal_ua_to_counts(uint32_t ua, uint32_t *counts)
+static bool cal_ua_to_counts(const pwm_ch_t *ch, uint32_t ua, uint32_t *counts)
 {
-    int32_t dc = (int32_t)g_cal_hi_counts - (int32_t)g_cal_lo_counts;
-    int32_t du = (int32_t)g_cal_hi_ua - (int32_t)g_cal_lo_ua;
-    int32_t u  = (int32_t)ua - (int32_t)g_cal_lo_ua;
+    int32_t dc = (int32_t)ch->cal_hi_counts - (int32_t)ch->cal_lo_counts;
+    int32_t du = (int32_t)ch->cal_hi_ua - (int32_t)ch->cal_lo_ua;
+    int32_t u  = (int32_t)ua - (int32_t)ch->cal_lo_ua;
     int64_t num = (int64_t)u * dc;
-    int32_t c   = (int32_t)g_cal_lo_counts + (int32_t)((num + (num >= 0 ? du / 2 : -du / 2)) / du);
+    int32_t c   = (int32_t)ch->cal_lo_counts + (int32_t)((num + (num >= 0 ? du / 2 : -du / 2)) / du);
 
     if (c < 0 || c > (int32_t)PWM_COUNTS)
     {
@@ -559,42 +606,46 @@ static void uart_put_ma(int32_t ua)
     uart_puts(" mA");
 }
 
-static void cmd_ma_show(void)
+static void cmd_ma_show(const pwm_ch_t *ch)
 {
-    uart_puts("ma: ");
-    uart_put_ma(cal_counts_to_ua(g_pwm_high));
+    uart_puts("ma");
+    uart_puts(ch->name);
+    uart_puts(": ");
+    uart_put_ma(cal_counts_to_ua(ch, ch->high));
     uart_puts(" (");
-    uart_putu(g_pwm_high);
+    uart_putu(ch->high);
     uart_puts("/");
     uart_putu(PWM_COUNTS);
     uart_puts(" counts)\n");
 }
 
-static void cmd_cal_show(void)
+static void cmd_cal_show(const pwm_ch_t *ch)
 {
-    uart_puts("cal: ");
-    uart_putu(g_cal_lo_counts);
+    uart_puts("cal");
+    uart_puts(ch->name);
+    uart_puts(": ");
+    uart_putu(ch->cal_lo_counts);
     uart_puts(" counts = ");
-    uart_put_ma((int32_t)g_cal_lo_ua);
+    uart_put_ma((int32_t)ch->cal_lo_ua);
     uart_puts(", ");
-    uart_putu(g_cal_hi_counts);
+    uart_putu(ch->cal_hi_counts);
     uart_puts(" counts = ");
-    uart_put_ma((int32_t)g_cal_hi_ua);
-    if (g_cal_lo_counts == CAL_LO_COUNTS_DEFAULT && g_cal_lo_ua == CAL_LO_UA_DEFAULT &&
-        g_cal_hi_counts == CAL_HI_COUNTS_DEFAULT && g_cal_hi_ua == CAL_HI_UA_DEFAULT)
+    uart_put_ma((int32_t)ch->cal_hi_ua);
+    if (ch->cal_lo_counts == CAL_LO_COUNTS_DEFAULT && ch->cal_lo_ua == CAL_LO_UA_DEFAULT &&
+        ch->cal_hi_counts == CAL_HI_COUNTS_DEFAULT && ch->cal_hi_ua == CAL_HI_UA_DEFAULT)
     {
         uart_puts(" (default)");
     }
-    uart_puts("\n     reachable ");
-    uart_put_ma(cal_counts_to_ua(0U));
+    uart_puts("\n      reachable ");
+    uart_put_ma(cal_counts_to_ua(ch, 0U));
     uart_puts(" .. ");
-    uart_put_ma(cal_counts_to_ua(PWM_COUNTS));
+    uart_put_ma(cal_counts_to_ua(ch, PWM_COUNTS));
     uart_puts(", ");
-    uart_putu((g_cal_hi_ua - g_cal_lo_ua) * 1000U / (g_cal_hi_counts - g_cal_lo_counts));
+    uart_putu((ch->cal_hi_ua - ch->cal_lo_ua) * 1000U / (ch->cal_hi_counts - ch->cal_lo_counts));
     uart_puts(" nA/count\n");
 }
 
-static void cmd_ma(int argc, char **argv)
+static void cmd_ma(pwm_ch_t *ch, int argc, char **argv)
 {
     uint32_t ua, counts;
 
@@ -602,94 +653,129 @@ static void cmd_ma(int argc, char **argv)
     {
         if (!parse_fixed(argv[1], 3, &ua) || ua > MA_MAX_UA)
         {
-            uart_puts("err: usage: ma <0.000..25.000>\n");
+            uart_put_usage(argv[0], " <0.000..25.000>\n");
             return;
         }
-        if (!cal_ua_to_counts(ua, &counts))
+        if (!cal_ua_to_counts(ch, ua, &counts))
         {
             uart_puts("err: out of range, reachable ");
-            uart_put_ma(cal_counts_to_ua(0U));
+            uart_put_ma(cal_counts_to_ua(ch, 0U));
             uart_puts(" .. ");
-            uart_put_ma(cal_counts_to_ua(PWM_COUNTS));
+            uart_put_ma(cal_counts_to_ua(ch, PWM_COUNTS));
             uart_puts("\n");
             return;
         }
-        pwm_set(counts);
+        pwm_set(ch, counts);
     }
-    cmd_ma_show();
+    cmd_ma_show(ch);
 }
 
-static void cmd_cal(int argc, char **argv)
+static void cal_reset(pwm_ch_t *ch)
+{
+    ch->cal_lo_counts = CAL_LO_COUNTS_DEFAULT;
+    ch->cal_lo_ua     = CAL_LO_UA_DEFAULT;
+    ch->cal_hi_counts = CAL_HI_COUNTS_DEFAULT;
+    ch->cal_hi_ua     = CAL_HI_UA_DEFAULT;
+}
+
+static void cmd_cal(pwm_ch_t *ch, int argc, char **argv)
 {
     uint32_t ua;
 
     if (argc < 2)
     {
-        cmd_cal_show();
+        cmd_cal_show(ch);
         return;
     }
     if (strcmp(argv[1], "reset") == 0)
     {
-        g_cal_lo_counts = CAL_LO_COUNTS_DEFAULT;
-        g_cal_lo_ua     = CAL_LO_UA_DEFAULT;
-        g_cal_hi_counts = CAL_HI_COUNTS_DEFAULT;
-        g_cal_hi_ua     = CAL_HI_UA_DEFAULT;
-        cmd_cal_show();
+        cal_reset(ch);
+        cmd_cal_show(ch);
         return;
     }
 
     bool lo = strcmp(argv[1], "lo") == 0;
     if ((!lo && strcmp(argv[1], "hi") != 0) || argc < 3 || !parse_fixed(argv[2], 3, &ua) || ua > MA_MAX_UA)
     {
-        uart_puts("err: usage: cal lo|hi <measured mA> | cal reset\n");
+        uart_put_usage(argv[0], " lo|hi <measured mA> | ");
+        uart_puts(argv[0]);
+        uart_puts(" reset\n");
         return;
     }
 
-    uint32_t lo_c = lo ? g_pwm_high : g_cal_lo_counts;
-    uint32_t lo_u = lo ? ua : g_cal_lo_ua;
-    uint32_t hi_c = lo ? g_cal_hi_counts : g_pwm_high;
-    uint32_t hi_u = lo ? g_cal_hi_ua : ua;
+    uint32_t lo_c = lo ? ch->high : ch->cal_lo_counts;
+    uint32_t lo_u = lo ? ua : ch->cal_lo_ua;
+    uint32_t hi_c = lo ? ch->cal_hi_counts : ch->high;
+    uint32_t hi_u = lo ? ch->cal_hi_ua : ua;
     if (!cal_valid(lo_c, lo_u, hi_c, hi_u))
     {
         uart_puts("err: lo and hi points must be at least 100 counts apart, hi above lo\n");
         return;
     }
-    g_cal_lo_counts = lo_c;
-    g_cal_lo_ua     = lo_u;
-    g_cal_hi_counts = hi_c;
-    g_cal_hi_ua     = hi_u;
-    cmd_cal_show();
+    ch->cal_lo_counts = lo_c;
+    ch->cal_lo_ua     = lo_u;
+    ch->cal_hi_counts = hi_c;
+    ch->cal_hi_ua     = hi_u;
+    cmd_cal_show(ch);
 }
 
 static void set_mode(led_mode_t mode, uint32_t color);
 
 static void apply_defaults(void)
 {
-    g_period_ms     = 500;
-    g_cal_lo_counts = CAL_LO_COUNTS_DEFAULT;
-    g_cal_lo_ua     = CAL_LO_UA_DEFAULT;
-    g_cal_hi_counts = CAL_HI_COUNTS_DEFAULT;
-    g_cal_hi_ua     = CAL_HI_UA_DEFAULT;
-    pwm_set(0U);
+    g_period_ms = 500;
+    for (uint32_t i = 0; i < PWM_CHANNELS; i++)
+    {
+        cal_reset(&g_ch[i]);
+        pwm_set(&g_ch[i], 0U);
+    }
     set_mode(MODE_CYCLE, 0);
+}
+
+static void state_to_settings(settings_t *st)
+{
+    st->mode      = (uint32_t)g_mode;
+    st->color     = g_color;
+    st->period_ms = g_period_ms;
+    for (uint32_t i = 0; i < PWM_CHANNELS; i++)
+    {
+        st->ch[i] = (settings_channel_t){
+            .pwm_high      = g_ch[i].high,
+            .cal_lo_counts = g_ch[i].cal_lo_counts,
+            .cal_lo_ua     = g_ch[i].cal_lo_ua,
+            .cal_hi_counts = g_ch[i].cal_hi_counts,
+            .cal_hi_ua     = g_ch[i].cal_hi_ua,
+        };
+    }
 }
 
 /* Restore saved settings; falls back to defaults if none or out of range. */
 static bool apply_saved(void)
 {
     settings_t st;
+    state_to_settings(&st); /* a record from older firmware only fills channel 1 */
     if (!settings_load(&st) || st.mode > MODE_BLINK || st.period_ms < 10U || st.period_ms > 10000U ||
-        st.pwm_high > PWM_COUNTS || (st.color & ~LED_ALL) != 0U ||
-        !cal_valid(st.cal_lo_counts, st.cal_lo_ua, st.cal_hi_counts, st.cal_hi_ua))
+        (st.color & ~LED_ALL) != 0U)
     {
         return false;
     }
-    g_period_ms     = st.period_ms;
-    g_cal_lo_counts = st.cal_lo_counts;
-    g_cal_lo_ua     = st.cal_lo_ua;
-    g_cal_hi_counts = st.cal_hi_counts;
-    g_cal_hi_ua     = st.cal_hi_ua;
-    pwm_set(st.pwm_high);
+    for (uint32_t i = 0; i < PWM_CHANNELS; i++)
+    {
+        const settings_channel_t *c = &st.ch[i];
+        if (c->pwm_high > PWM_COUNTS || !cal_valid(c->cal_lo_counts, c->cal_lo_ua, c->cal_hi_counts, c->cal_hi_ua))
+        {
+            return false;
+        }
+    }
+    g_period_ms = st.period_ms;
+    for (uint32_t i = 0; i < PWM_CHANNELS; i++)
+    {
+        g_ch[i].cal_lo_counts = st.ch[i].cal_lo_counts;
+        g_ch[i].cal_lo_ua     = st.ch[i].cal_lo_ua;
+        g_ch[i].cal_hi_counts = st.ch[i].cal_hi_counts;
+        g_ch[i].cal_hi_ua     = st.ch[i].cal_hi_ua;
+        pwm_set(&g_ch[i], st.ch[i].pwm_high);
+    }
     set_mode((led_mode_t)st.mode, st.color);
     return true;
 }
@@ -714,17 +800,8 @@ static void print_flash_result(int32_t st)
 
 static void cmd_save(void)
 {
-    settings_t st = {
-        .mode      = (uint32_t)g_mode,
-        .color     = g_color,
-        .period_ms = g_period_ms,
-        .pwm_high  = g_pwm_high,
-
-        .cal_lo_counts = g_cal_lo_counts,
-        .cal_lo_ua     = g_cal_lo_ua,
-        .cal_hi_counts = g_cal_hi_counts,
-        .cal_hi_ua     = g_cal_hi_ua,
-    };
+    settings_t st;
+    state_to_settings(&st);
     print_flash_result(settings_save(&st));
 }
 
@@ -743,6 +820,28 @@ static void set_mode(led_mode_t mode, uint32_t color)
     leds_set(mode == MODE_CYCLE ? LED_RED : color);
 }
 
+/* "pwm", "pwm1" -> channel 1, "pwm2" -> channel 2; NULL if cmd isn't base[N]. */
+static pwm_ch_t *channel_cmd(const char *cmd, const char *base)
+{
+    size_t n = strlen(base);
+    if (strncmp(cmd, base, n) != 0)
+    {
+        return NULL;
+    }
+    if (cmd[n] == '\0')
+    {
+        return &g_ch[0];
+    }
+    for (uint32_t i = 0; i < PWM_CHANNELS; i++)
+    {
+        if (strcmp(cmd + n, g_ch[i].name) == 0)
+        {
+            return &g_ch[i];
+        }
+    }
+    return NULL;
+}
+
 static void run_command(char *line)
 {
     char *argv[3];
@@ -758,6 +857,7 @@ static void run_command(char *line)
     }
 
     uint32_t val;
+    pwm_ch_t *ch;
     if (strcmp(argv[0], "help") == 0 || strcmp(argv[0], "?") == 0)
     {
         cmd_help();
@@ -783,17 +883,17 @@ static void run_command(char *line)
         set_mode(argv[0][0] == 'l' ? MODE_SOLID : MODE_BLINK, val);
         uart_puts("ok\n");
     }
-    else if (strcmp(argv[0], "pwm") == 0)
+    else if ((ch = channel_cmd(argv[0], "pwm")) != NULL)
     {
-        cmd_pwm(argc, argv);
+        cmd_pwm(ch, argc, argv);
     }
-    else if (strcmp(argv[0], "ma") == 0)
+    else if ((ch = channel_cmd(argv[0], "ma")) != NULL)
     {
-        cmd_ma(argc, argv);
+        cmd_ma(ch, argc, argv);
     }
-    else if (strcmp(argv[0], "cal") == 0)
+    else if ((ch = channel_cmd(argv[0], "cal")) != NULL)
     {
-        cmd_cal(argc, argv);
+        cmd_cal(ch, argc, argv);
     }
     else if (strcmp(argv[0], "save") == 0)
     {
