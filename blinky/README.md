@@ -3,9 +3,14 @@
 Bare-metal firmware for the NXP FRDM-MCXA153 board: RGB LED control, a
 serial command shell, a PWM output on P1_4 (J1-2), and settings saved to flash.
 
+Used for BAM 1 v5 regression (CY26 Q4 Goal 2): the PWM output drives a
+4-20 mA module wired to the BAM pressure input, so test scripts can send a
+pressure reading with `ma <mA>` and check what the BAM reports. Owner: Ed
+(requested the project); built by Dom.
+
 ## Make commands
 
-Run these from this directory (`/home/dom/proj/MCXA153/blinky`).
+Run these from this directory (`BAM1_v5_Regression/MCXA153/blinky`).
 
 | Command | What it does |
 |---|---|
