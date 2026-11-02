@@ -1,7 +1,7 @@
 # FRDM-MCXA153 blinky + serial shell
 
-Bare-metal firmware for the NXP FRDM-MCXA153 board: RGB LED control, a
-serial command shell, two independent PWM outputs (P1_4 on J1-2 and P1_3), and
+Bare-metal firmware for the NXP FRDM-MCXA153 board: RGB LED control, two
+serial command shells (MCU-Link UART and native USB), two independent PWM outputs (P1_4 on J1-2 and P1_3), and
 settings saved to flash.
 
 Used for BAM 1 v5 regression (CY26 Q4 Goal 2): each PWM output drives a
@@ -12,6 +12,13 @@ setpoints. Owner: Ed
 (requested the project); built by Dom.
 
 ## Make commands
+
+TinyUSB is a git submodule (`lib/tinyusb`, pinned to 0.21.0). After a fresh
+clone, fetch it once:
+
+```
+git submodule update --init
+```
 
 Run these from this directory (`BAM1_v5_Regression/MCXA153/blinky`).
 
@@ -45,13 +52,36 @@ make flash PYOCD=/path/to/pyocd
 | `~/.venvs/pyocd/bin/pyocd erase -t mcxa153vlh --chip` | Erase the whole flash, including saved settings |
 | `~/.venvs/pyocd/bin/pyocd commander -t mcxa153vlh` | Interactive debug prompt (halt, step, read/write memory) |
 
-## Serial shell
+## Serial shells
 
-Connect at 115200 baud, 8N1:
+There are two independent shells with the same commands. Each command's
+output goes back to the port it was typed on, and both can be open at once.
+
+| Port | Board connector | Linux device (typical) |
+|---|---|---|
+| UART (LPUART0, bridged by MCU-Link) | MCU-Link USB-C (J15) | `/dev/ttyACM0` |
+| Native USB CDC (TinyUSB, MCU USB0) | MCU USB (J8) | `/dev/ttyACM1` (`ttyACM0` if J15 is unplugged) |
+
+J8 is the port for sending commands to the app. The ttyACM numbers depend
+on which cables are plugged in and in what order, so scripts should use the
+stable name instead:
 
 ```
-picocom -b 115200 /dev/ttyACM0      # exit: Ctrl-A then Ctrl-X
+/dev/serial/by-id/usb-BAM1_MCXA153_4-20_mA_shell_0001-if00
 ```
+
+```
+picocom /dev/serial/by-id/usb-BAM1_MCXA153_4-20_mA_shell_0001-if00   # J8; baud ignored
+picocom -b 115200 /dev/ttyACM0      # J15 UART shell; exit: Ctrl-A then Ctrl-X
+```
+
+J15 is only needed for `make flash` (and the UART shell); J8 alone is
+enough for commands once the firmware is on the board.
+
+The USB shell prints its banner each time a terminal opens the port (DTR
+set). Output is dropped while no terminal has it open, so an unattended USB
+port never holds up the UART shell. The USB port only exists while a host
+is connected; `reset` (from either shell) makes it re-enumerate.
 
 | Command | Effect |
 |---|---|
@@ -133,12 +163,16 @@ Resolution is about 16 µA per count (1000 counts over 4-20 mA).
 
 ## Hardware notes
 
-- Connect the board to the Pi with the USB-C port labelled **MCU-Link** (J15).
+- Commands: connect **MCU USB (J8)** to the Pi. Flashing: connect the
+  USB-C port labelled **MCU-Link** (J15).
 - RGB LED: red P3_12, green P3_13, blue P3_0 (active low).
 - PWM: channel 1 on P1_4 (header J1 pin 2), channel 2 on P1_3, 12 kHz,
   1000 counts per period. Add an RC low-pass filter (for example 10 kΩ +
   1 µF) to each to get 0 to 3.3 V.
-- Core clock: 48 MHz (FIRC, as left by the boot ROM).
+- Core clock: 48 MHz (FIRC, as left by the boot ROM). USB0 runs from the
+  same FIRC 48 MHz clock (crystal-less, as in NXP's and TinyUSB's examples).
+- USB VID:PID is `cafe:4001`, TinyUSB's test VID: fine on the bench, not for
+  shipped hardware.
 - Saved settings live in the last 8 KB flash sector (0x1E000). `make flash`
   does not erase it. Settings saved by the older single-channel firmware are
   still read (as channel 1); the first `save` rewrites the sector in the
@@ -157,7 +191,9 @@ python3 -m venv ~/.venvs/pyocd
 
 | Path | Contents |
 |---|---|
-| `main.c` | LED, UART shell, PWM, commands |
+| `main.c` | LED, UART and USB shells, PWM, commands |
+| `usb_descriptors.c`, `tusb_config.h` | TinyUSB CDC device descriptors and configuration |
+| `lib/tinyusb/` | TinyUSB 0.21.0 (git submodule) |
 | `settings.c`, `settings.h` | Save and load settings in flash via the boot ROM API |
 | `Makefile` | Build and flash rules |
 | `device/` | NXP MCXA153 headers, startup code, system init, linker script (from NXP DFP 26.09.00) |

@@ -1,0 +1,3 @@
+[submodule "blinky/lib/tinyusb"]
+	path = blinky/lib/tinyusb
+	url = https://github.com/hathach/tinyusb

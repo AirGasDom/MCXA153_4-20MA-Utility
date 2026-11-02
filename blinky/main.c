@@ -10,6 +10,12 @@
  * MCU-Link bridges to the host as a USB CDC port (/dev/ttyACM0 on Linux).
  * 115200 8N1. Type "help" for commands.
  *
+ * A second, independent shell runs on the MCU's own USB FS port (the
+ * FRDM-MCXA153's MCU USB connector, J8) as a TinyUSB CDC-ACM device, e.g.
+ * /dev/ttyACM1. Both shells accept the same commands; each command's
+ * output goes back to the port it was typed on. The banner is printed
+ * each time a terminal opens the USB port.
+ *
  * Two PWM outputs from CTIMER1, 12 kHz, 1000 counts/period:
  *   channel 1 = P1_4 (header J1-2), match 2
  *   channel 2 = P1_3, match 1
@@ -26,13 +32,15 @@
  * restored at power-up. "defaults" erases them.
  *
  * Core clock is left as the boot ROM set it (FIRC, 48 MHz) and read back from
- * SCG; LPUART0 runs from FRO12M. SysTick provides a 1 ms tick.
+ * SCG; LPUART0 runs from FRO12M, USB0 from the FIRC 48 MHz peripheral
+ * clock. SysTick provides a 1 ms tick.
  */
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include "fsl_device_registers.h"
 #include "settings.h"
+#include "tusb.h"
 
 #define LED_RED   (1UL << 12)
 #define LED_GREEN (1UL << 13)
@@ -43,8 +51,9 @@
 #define MRCC0_CTIMER1 (1UL << 3)
 #define MRCC0_LPUART0 (1UL << 19)
 #define MRCC0_PORT0   (1UL << 29)
+#define MRCC0_USB0    (1UL << 22)
 #define MRCC0_PORT1   (1UL << 30)
-#define MRCC0_ALL     (MRCC0_CTIMER1 | MRCC0_LPUART0 | MRCC0_PORT0 | MRCC0_PORT1)
+#define MRCC0_ALL     (MRCC0_CTIMER1 | MRCC0_LPUART0 | MRCC0_USB0 | MRCC0_PORT0 | MRCC0_PORT1)
 #define MRCC1_PORT3   (1UL << 0)
 #define MRCC1_GPIO3   (1UL << 8)
 
@@ -69,6 +78,8 @@
 #define RX_BUF_SIZE 64U /* power of two */
 #define LINE_MAX    64U
 
+#define USB_TX_TIMEOUT_MS 50U /* give up on a host that stops reading */
+
 typedef enum
 {
     MODE_CYCLE,
@@ -77,12 +88,21 @@ typedef enum
 } led_mode_t;
 
 static volatile uint32_t g_ticks;
+static bool g_restored; /* settings came from flash at power-up */
+static uint32_t g_reset_srs; /* CMC->SRS at boot: why the chip last reset */
 
-static volatile uint8_t g_rx_buf[RX_BUF_SIZE];
-static volatile uint32_t g_rx_head;
-static volatile uint32_t g_rx_tail;
-static volatile uint32_t g_rx_overruns;
-static volatile uint32_t g_rx_errors;
+/* One LPUART shell port: its peripheral and interrupt-fed RX ring. */
+typedef struct
+{
+    LPUART_Type *base;
+    volatile uint8_t rx_buf[RX_BUF_SIZE];
+    volatile uint32_t rx_head;
+    volatile uint32_t rx_tail;
+    volatile uint32_t rx_overruns;
+    volatile uint32_t rx_errors;
+} uart_port_t;
+
+static uart_port_t g_uart0 = {.base = LPUART0};
 
 static led_mode_t g_mode     = MODE_CYCLE;
 static uint32_t g_color      = LED_RED;
@@ -138,37 +158,54 @@ void SysTick_Handler(void)
     g_ticks++;
 }
 
-void LPUART0_IRQHandler(void)
+static void uart_rx_irq(uart_port_t *u)
 {
-    uint32_t stat = LPUART0->STAT;
+    LPUART_Type *base = u->base;
+    uint32_t stat     = base->STAT;
 
     if (stat & LPUART_STAT_OR_MASK)
     {
-        LPUART0->STAT = LPUART_STAT_OR_MASK; /* write-1-to-clear */
-        g_rx_overruns++;
+        base->STAT = LPUART_STAT_OR_MASK; /* write-1-to-clear */
+        u->rx_overruns++;
     }
-    while (LPUART0->STAT & LPUART_STAT_RDRF_MASK)
+    while (base->STAT & LPUART_STAT_RDRF_MASK)
     {
-        uint32_t err  = LPUART0->STAT & (LPUART_STAT_FE_MASK | LPUART_STAT_NF_MASK | LPUART_STAT_PF_MASK);
-        uint8_t c     = (uint8_t)LPUART0->DATA;
+        uint32_t err  = base->STAT & (LPUART_STAT_FE_MASK | LPUART_STAT_NF_MASK | LPUART_STAT_PF_MASK);
+        uint8_t c     = (uint8_t)base->DATA;
         if (err)
         {
             /* Line glitch (e.g. during probe reset): drop the byte. */
-            LPUART0->STAT = err;
-            g_rx_errors++;
+            base->STAT = err;
+            u->rx_errors++;
             continue;
         }
-        uint32_t next = (g_rx_head + 1U) & (RX_BUF_SIZE - 1U);
-        if (next != g_rx_tail)
+        uint32_t next = (u->rx_head + 1U) & (RX_BUF_SIZE - 1U);
+        if (next != u->rx_tail)
         {
-            g_rx_buf[g_rx_head] = c;
-            g_rx_head           = next;
+            u->rx_buf[u->rx_head] = c;
+            u->rx_head            = next;
         }
         else
         {
-            g_rx_overruns++;
+            u->rx_overruns++;
         }
     }
+}
+
+void LPUART0_IRQHandler(void)
+{
+    uart_rx_irq(&g_uart0);
+}
+
+void USB0_IRQHandler(void)
+{
+    tusb_int_handler(0, true);
+}
+
+/* TinyUSB's time base. */
+uint32_t tusb_time_millis_api(void)
+{
+    return g_ticks;
 }
 
 /* -------------------------------------------------------------- hardware */
@@ -218,6 +255,12 @@ static void clocks_init(void)
     MRCC0->MRCC_CTIMER1_CLKDIV = (1UL << 30);
     MRCC0->MRCC_CTIMER1_CLKDIV = 0U;
 
+    /* USB0: FIRC 48 MHz peripheral clock (the ROM leaves FIRC at 48 MHz). */
+    SCG0->FIRCCSR &= ~SCG_FIRCCSR_LK_MASK;
+    SCG0->FIRCCSR |= SCG_FIRCCSR_FIRC_SCLK_PERIPH_EN_MASK;
+    SCG0->FIRCCSR |= SCG_FIRCCSR_LK_MASK;
+    MRCC0->MRCC_USB0_CLKSEL = 1U; /* CLK_48M */
+
     /* Ungate bus clocks and release peripherals from reset. */
     MRCC0->MRCC_GLB_CC0_SET  = MRCC0_ALL;
     MRCC0->MRCC_GLB_CC1_SET  = MRCC1_PORT3 | MRCC1_GPIO3;
@@ -250,18 +293,25 @@ static void leds_set(uint32_t mask)
     GPIO3->PCOR = mask;
 }
 
+/* 115200 8N1, RX interrupt on. */
+static void uart_port_init(uart_port_t *u, IRQn_Type irq)
+{
+    LPUART_Type *base = u->base;
+
+    base->CTRL = 0U;
+    base->BAUD = LPUART_BAUD_OSR(UART_OSR - 1U) | LPUART_BAUD_SBR(UART_SBR);
+    base->STAT = LPUART_STAT_OR_MASK; /* clear stale overrun */
+    base->CTRL = LPUART_CTRL_TE_MASK | LPUART_CTRL_RE_MASK | LPUART_CTRL_RIE_MASK;
+
+    NVIC_EnableIRQ(irq);
+}
+
 static void uart_init(void)
 {
     /* P0_2 = LPUART0_RXD, P0_3 = LPUART0_TXD (ALT2); pull-up on RX. */
     PORT0->PCR[2] = PORT_PCR_MUX(2) | PORT_PCR_IBE_MASK | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
     PORT0->PCR[3] = PORT_PCR_MUX(2) | PORT_PCR_IBE_MASK;
-
-    LPUART0->CTRL = 0U;
-    LPUART0->BAUD = LPUART_BAUD_OSR(UART_OSR - 1U) | LPUART_BAUD_SBR(UART_SBR);
-    LPUART0->STAT = LPUART_STAT_OR_MASK; /* clear stale overrun */
-    LPUART0->CTRL = LPUART_CTRL_TE_MASK | LPUART_CTRL_RE_MASK | LPUART_CTRL_RIE_MASK;
-
-    NVIC_EnableIRQ(LPUART0_IRQn);
+    uart_port_init(&g_uart0, LPUART0_IRQn);
 }
 
 /* In CTIMER PWM mode the output is low from TC=0 until TC matches the
@@ -295,29 +345,135 @@ static void pwm_init(void)
     CTIMER1->TCR  = CTIMER_TCR_CEN_MASK;
 }
 
-/* ---------------------------------------------------------------- output */
+/* -------------------------------------------------------------- serial io */
 
-static void uart_putc(char c)
+static void lpuart_putc(uart_port_t *u, char c)
 {
-    while (!(LPUART0->STAT & LPUART_STAT_TDRE_MASK))
+    while (!(u->base->STAT & LPUART_STAT_TDRE_MASK))
     {
     }
-    LPUART0->DATA = (uint8_t)c;
+    u->base->DATA = (uint8_t)c;
 }
 
-static void uart_puts(const char *s)
+static bool lpuart_getc(uart_port_t *u, char *c)
+{
+    if (u->rx_tail == u->rx_head)
+    {
+        return false;
+    }
+    *c         = (char)u->rx_buf[u->rx_tail];
+    u->rx_tail = (u->rx_tail + 1U) & (RX_BUF_SIZE - 1U);
+    return true;
+}
+
+static void lpuart_flush(uart_port_t *u)
+{
+    while (!(u->base->STAT & LPUART_STAT_TC_MASK))
+    {
+    }
+}
+
+/* Output is dropped while no terminal has the port open (DTR low), and if
+ * the host stops reading, so the main loop never blocks on USB. */
+static void usb_putc(char c)
+{
+    static bool stalled;
+    uint32_t start = g_ticks;
+
+    while (tud_cdc_connected() && tud_cdc_write_char(c) == 0U)
+    {
+        if (stalled || (g_ticks - start) >= USB_TX_TIMEOUT_MS)
+        {
+            stalled = true; /* drop until the FIFO has room again */
+            return;
+        }
+        tud_task(); /* FIFO full: let the stack send it */
+        tud_cdc_write_flush();
+    }
+    stalled = false;
+}
+
+static bool usb_getc(char *c)
+{
+    return tud_cdc_available() && tud_cdc_read(c, 1U) == 1U;
+}
+
+static void usb_flush(void)
+{
+    uint32_t start = g_ticks;
+
+    tud_cdc_write_flush();
+    while (tud_cdc_connected() && tud_cdc_write_available() < CFG_TUD_CDC_TX_BUFSIZE &&
+           (g_ticks - start) < USB_TX_TIMEOUT_MS)
+    {
+        tud_task();
+        tud_cdc_write_flush();
+    }
+}
+
+/* -------------------------------------------------------------- shells */
+
+/* One command shell per port. Output from a command goes to the shell that
+ * is running it (g_out). */
+typedef struct
+{
+    uart_port_t *uart; /* NULL: the USB CDC port */
+    char line[LINE_MAX];
+    uint32_t len;
+    char prev;
+} shell_t;
+
+static shell_t g_uart_shell = {.uart = &g_uart0};
+static shell_t g_usb_shell  = {.uart = NULL};
+static shell_t *g_out       = &g_uart_shell;
+
+static volatile bool g_usb_greet; /* a terminal opened the USB port */
+
+/* ---------------------------------------------------------------- output */
+
+static bool shell_getc(shell_t *sh, char *c)
+{
+    return sh->uart ? lpuart_getc(sh->uart, c) : usb_getc(c);
+}
+
+/* Wait until queued output has left the MCU. */
+static void shell_flush(shell_t *sh)
+{
+    if (sh->uart)
+    {
+        lpuart_flush(sh->uart);
+    }
+    else
+    {
+        usb_flush();
+    }
+}
+
+static void out_putc(char c)
+{
+    if (g_out->uart)
+    {
+        lpuart_putc(g_out->uart, c);
+    }
+    else
+    {
+        usb_putc(c);
+    }
+}
+
+static void out_puts(const char *s)
 {
     while (*s)
     {
         if (*s == '\n')
         {
-            uart_putc('\r');
+            out_putc('\r');
         }
-        uart_putc(*s++);
+        out_putc(*s++);
     }
 }
 
-static void uart_putu(uint32_t v)
+static void out_putu(uint32_t v)
 {
     char buf[11];
     int i = sizeof(buf) - 1;
@@ -327,38 +483,27 @@ static void uart_putu(uint32_t v)
         buf[--i] = (char)('0' + (v % 10U));
         v /= 10U;
     } while (v != 0U);
-    uart_puts(&buf[i]);
+    out_puts(&buf[i]);
 }
 
 /* Print v / 10^decimals with a fixed number of decimals. */
-static void uart_putfix(uint32_t v, uint32_t decimals)
+static void out_putfix(uint32_t v, uint32_t decimals)
 {
     uint32_t div = 1;
     for (uint32_t i = 0; i < decimals; i++)
     {
         div *= 10U;
     }
-    uart_putu(v / div);
+    out_putu(v / div);
     if (decimals)
     {
         uint32_t frac = v % div;
-        uart_putc('.');
+        out_putc('.');
         for (uint32_t d = div / 10U; d > 0U; d /= 10U)
         {
-            uart_putc((char)('0' + (frac / d) % 10U));
+            out_putc((char)('0' + (frac / d) % 10U));
         }
     }
-}
-
-static bool uart_getc(char *c)
-{
-    if (g_rx_tail == g_rx_head)
-    {
-        return false;
-    }
-    *c        = (char)g_rx_buf[g_rx_tail];
-    g_rx_tail = (g_rx_tail + 1U) & (RX_BUF_SIZE - 1U);
-    return true;
 }
 
 /* -------------------------------------------------------------- commands */
@@ -456,7 +601,7 @@ static const char *color_name(uint32_t mask)
 
 static void cmd_help(void)
 {
-    uart_puts("commands:\n"
+    out_puts("commands:\n"
               "  help               this text\n"
               "  led <color>        solid color\n"
               "  blink <color>      blink a color\n"
@@ -482,27 +627,72 @@ static void cmd_help(void)
 static void cmd_pwm_show(const pwm_ch_t *ch);
 static void cmd_ma_show(const pwm_ch_t *ch);
 
+/* Name the reset source(s) recorded in CMC->SRS, e.g. "pin" or "power-on". */
+static void out_reset_cause(uint32_t srs)
+{
+    static const struct
+    {
+        uint32_t mask;
+        const char *name;
+    } k_causes[] = {
+        {CMC_SRS_POR_MASK, "power-on"},
+        {CMC_SRS_VD_MASK, "low-voltage"},
+        {CMC_SRS_PIN_MASK, "pin"},
+        {CMC_SRS_DAP_MASK, "debugger"},
+        {CMC_SRS_SW_MASK, "software"},
+        {CMC_SRS_LOCKUP_MASK, "lockup"},
+        {CMC_SRS_WWDT0_MASK, "watchdog"},
+        {CMC_SRS_CDOG0_MASK, "code-watchdog"},
+        {CMC_SRS_SCG_MASK, "clock-loss"},
+        {CMC_SRS_FATAL_MASK, "fatal"},
+        {CMC_SRS_JTAG_MASK, "jtag"},
+        {CMC_SRS_RSTACK_MASK, "reset-timeout"},
+        {CMC_SRS_LPACK_MASK, "lowpower-timeout"},
+        {CMC_SRS_WAKEUP_MASK, "wakeup"},
+    };
+    bool any = false;
+
+    for (size_t i = 0; i < sizeof(k_causes) / sizeof(k_causes[0]); i++)
+    {
+        if (srs & k_causes[i].mask)
+        {
+            if (any)
+            {
+                out_putc('+');
+            }
+            out_puts(k_causes[i].name);
+            any = true;
+        }
+    }
+    if (!any)
+    {
+        out_puts("unknown");
+    }
+}
+
 static void cmd_status(void)
 {
     static const char *const mode_names[] = {"cycle", "solid", "blink"};
-    uart_puts("mode=");
-    uart_puts(mode_names[g_mode]);
+    out_puts("mode=");
+    out_puts(mode_names[g_mode]);
     if (g_mode != MODE_CYCLE)
     {
-        uart_puts(" color=");
-        uart_puts(color_name(g_color));
+        out_puts(" color=");
+        out_puts(color_name(g_color));
     }
-    uart_puts(" rate=");
-    uart_putu(g_period_ms);
-    uart_puts("ms uptime=");
-    uart_putu(g_ticks / 1000U);
-    uart_puts("s core=");
-    uart_putu(SystemCoreClock);
-    uart_puts("Hz rx_overruns=");
-    uart_putu(g_rx_overruns);
-    uart_puts(" rx_errors=");
-    uart_putu(g_rx_errors);
-    uart_puts("\n");
+    out_puts(" rate=");
+    out_putu(g_period_ms);
+    out_puts("ms uptime=");
+    out_putu(g_ticks / 1000U);
+    out_puts("s reset=");
+    out_reset_cause(g_reset_srs);
+    out_puts(" core=");
+    out_putu(SystemCoreClock);
+    out_puts("Hz rx_overruns=");
+    out_putu(g_uart0.rx_overruns);
+    out_puts(" rx_errors=");
+    out_putu(g_uart0.rx_errors);
+    out_puts("\n");
     for (uint32_t i = 0; i < PWM_CHANNELS; i++)
     {
         cmd_pwm_show(&g_ch[i]);
@@ -511,32 +701,32 @@ static void cmd_status(void)
 }
 
 /* "err: usage: <cmd> <rest>" so the message names pwm or pwm2 as typed. */
-static void uart_put_usage(const char *cmd, const char *rest)
+static void out_usage(const char *cmd, const char *rest)
 {
-    uart_puts("err: usage: ");
-    uart_puts(cmd);
-    uart_puts(rest);
+    out_puts("err: usage: ");
+    out_puts(cmd);
+    out_puts(rest);
 }
 
 static void cmd_pwm_show(const pwm_ch_t *ch)
 {
     uint32_t mv = (VDD_MV * ch->high + PWM_COUNTS / 2U) / PWM_COUNTS;
 
-    uart_puts("pwm");
-    uart_puts(ch->name);
-    uart_puts(": ");
-    uart_putu(ch->high);
-    uart_puts("/");
-    uart_putu(PWM_COUNTS);
-    uart_puts(" counts (");
-    uart_putfix(ch->high * 1000U / PWM_COUNTS, 1);
-    uart_puts("%) @ ");
-    uart_putu(PWM_FREQ_HZ);
-    uart_puts(" Hz -> ");
-    uart_putfix(mv, 3);
-    uart_puts(" V avg on ");
-    uart_puts(ch->pin);
-    uart_puts("\n");
+    out_puts("pwm");
+    out_puts(ch->name);
+    out_puts(": ");
+    out_putu(ch->high);
+    out_puts("/");
+    out_putu(PWM_COUNTS);
+    out_puts(" counts (");
+    out_putfix(ch->high * 1000U / PWM_COUNTS, 1);
+    out_puts("%) @ ");
+    out_putu(PWM_FREQ_HZ);
+    out_puts(" Hz -> ");
+    out_putfix(mv, 3);
+    out_puts(" V avg on ");
+    out_puts(ch->pin);
+    out_puts("\n");
 }
 
 static void cmd_pwm(pwm_ch_t *ch, int argc, char **argv)
@@ -547,7 +737,7 @@ static void cmd_pwm(pwm_ch_t *ch, int argc, char **argv)
     {
         if (argc < 3 || !parse_u32(argv[2], &val) || val > PWM_COUNTS)
         {
-            uart_put_usage(argv[0], " counts <0..1000>\n");
+            out_usage(argv[0], " counts <0..1000>\n");
             return;
         }
         pwm_set(ch, val);
@@ -556,9 +746,9 @@ static void cmd_pwm(pwm_ch_t *ch, int argc, char **argv)
     {
         if (!parse_fixed(argv[1], 1, &val) || val > 1000U)
         {
-            uart_put_usage(argv[0], " <0..100> | ");
-            uart_puts(argv[0]);
-            uart_puts(" counts <0..1000>\n");
+            out_usage(argv[0], " <0..100> | ");
+            out_puts(argv[0]);
+            out_puts(" counts <0..1000>\n");
             return;
         }
         pwm_set(ch, (val * PWM_COUNTS + 500U) / 1000U);
@@ -600,49 +790,49 @@ static bool cal_valid(uint32_t lo_c, uint32_t lo_ua, uint32_t hi_c, uint32_t hi_
            hi_ua > lo_ua && hi_ua <= MA_MAX_UA;
 }
 
-static void uart_put_ma(int32_t ua)
+static void out_ma(int32_t ua)
 {
-    uart_putfix(ua < 0 ? 0U : (uint32_t)ua, 3);
-    uart_puts(" mA");
+    out_putfix(ua < 0 ? 0U : (uint32_t)ua, 3);
+    out_puts(" mA");
 }
 
 static void cmd_ma_show(const pwm_ch_t *ch)
 {
-    uart_puts("ma");
-    uart_puts(ch->name);
-    uart_puts(": ");
-    uart_put_ma(cal_counts_to_ua(ch, ch->high));
-    uart_puts(" (");
-    uart_putu(ch->high);
-    uart_puts("/");
-    uart_putu(PWM_COUNTS);
-    uart_puts(" counts)\n");
+    out_puts("ma");
+    out_puts(ch->name);
+    out_puts(": ");
+    out_ma(cal_counts_to_ua(ch, ch->high));
+    out_puts(" (");
+    out_putu(ch->high);
+    out_puts("/");
+    out_putu(PWM_COUNTS);
+    out_puts(" counts)\n");
 }
 
 static void cmd_cal_show(const pwm_ch_t *ch)
 {
-    uart_puts("cal");
-    uart_puts(ch->name);
-    uart_puts(": ");
-    uart_putu(ch->cal_lo_counts);
-    uart_puts(" counts = ");
-    uart_put_ma((int32_t)ch->cal_lo_ua);
-    uart_puts(", ");
-    uart_putu(ch->cal_hi_counts);
-    uart_puts(" counts = ");
-    uart_put_ma((int32_t)ch->cal_hi_ua);
+    out_puts("cal");
+    out_puts(ch->name);
+    out_puts(": ");
+    out_putu(ch->cal_lo_counts);
+    out_puts(" counts = ");
+    out_ma((int32_t)ch->cal_lo_ua);
+    out_puts(", ");
+    out_putu(ch->cal_hi_counts);
+    out_puts(" counts = ");
+    out_ma((int32_t)ch->cal_hi_ua);
     if (ch->cal_lo_counts == CAL_LO_COUNTS_DEFAULT && ch->cal_lo_ua == CAL_LO_UA_DEFAULT &&
         ch->cal_hi_counts == CAL_HI_COUNTS_DEFAULT && ch->cal_hi_ua == CAL_HI_UA_DEFAULT)
     {
-        uart_puts(" (default)");
+        out_puts(" (default)");
     }
-    uart_puts("\n      reachable ");
-    uart_put_ma(cal_counts_to_ua(ch, 0U));
-    uart_puts(" .. ");
-    uart_put_ma(cal_counts_to_ua(ch, PWM_COUNTS));
-    uart_puts(", ");
-    uart_putu((ch->cal_hi_ua - ch->cal_lo_ua) * 1000U / (ch->cal_hi_counts - ch->cal_lo_counts));
-    uart_puts(" nA/count\n");
+    out_puts("\n      reachable ");
+    out_ma(cal_counts_to_ua(ch, 0U));
+    out_puts(" .. ");
+    out_ma(cal_counts_to_ua(ch, PWM_COUNTS));
+    out_puts(", ");
+    out_putu((ch->cal_hi_ua - ch->cal_lo_ua) * 1000U / (ch->cal_hi_counts - ch->cal_lo_counts));
+    out_puts(" nA/count\n");
 }
 
 static void cmd_ma(pwm_ch_t *ch, int argc, char **argv)
@@ -653,16 +843,16 @@ static void cmd_ma(pwm_ch_t *ch, int argc, char **argv)
     {
         if (!parse_fixed(argv[1], 3, &ua) || ua > MA_MAX_UA)
         {
-            uart_put_usage(argv[0], " <0.000..25.000>\n");
+            out_usage(argv[0], " <0.000..25.000>\n");
             return;
         }
         if (!cal_ua_to_counts(ch, ua, &counts))
         {
-            uart_puts("err: out of range, reachable ");
-            uart_put_ma(cal_counts_to_ua(ch, 0U));
-            uart_puts(" .. ");
-            uart_put_ma(cal_counts_to_ua(ch, PWM_COUNTS));
-            uart_puts("\n");
+            out_puts("err: out of range, reachable ");
+            out_ma(cal_counts_to_ua(ch, 0U));
+            out_puts(" .. ");
+            out_ma(cal_counts_to_ua(ch, PWM_COUNTS));
+            out_puts("\n");
             return;
         }
         pwm_set(ch, counts);
@@ -697,9 +887,9 @@ static void cmd_cal(pwm_ch_t *ch, int argc, char **argv)
     bool lo = strcmp(argv[1], "lo") == 0;
     if ((!lo && strcmp(argv[1], "hi") != 0) || argc < 3 || !parse_fixed(argv[2], 3, &ua) || ua > MA_MAX_UA)
     {
-        uart_put_usage(argv[0], " lo|hi <measured mA> | ");
-        uart_puts(argv[0]);
-        uart_puts(" reset\n");
+        out_usage(argv[0], " lo|hi <measured mA> | ");
+        out_puts(argv[0]);
+        out_puts(" reset\n");
         return;
     }
 
@@ -709,7 +899,7 @@ static void cmd_cal(pwm_ch_t *ch, int argc, char **argv)
     uint32_t hi_u = lo ? ch->cal_hi_ua : ua;
     if (!cal_valid(lo_c, lo_u, hi_c, hi_u))
     {
-        uart_puts("err: lo and hi points must be at least 100 counts apart, hi above lo\n");
+        out_puts("err: lo and hi points must be at least 100 counts apart, hi above lo\n");
         return;
     }
     ch->cal_lo_counts = lo_c;
@@ -784,17 +974,17 @@ static void print_flash_result(int32_t st)
 {
     if (st == 0)
     {
-        uart_puts("ok (");
-        uart_putu(settings_used_slots());
-        uart_puts("/");
-        uart_putu(SETTINGS_SLOTS);
-        uart_puts(" slots used)\n");
+        out_puts("ok (");
+        out_putu(settings_used_slots());
+        out_puts("/");
+        out_putu(SETTINGS_SLOTS);
+        out_puts(" slots used)\n");
     }
     else
     {
-        uart_puts("err: flash status ");
-        uart_putu((uint32_t)st);
-        uart_puts("\n");
+        out_puts("err: flash status ");
+        out_putu((uint32_t)st);
+        out_puts("\n");
     }
 }
 
@@ -869,19 +1059,19 @@ static void run_command(char *line)
     else if (strcmp(argv[0], "cycle") == 0)
     {
         set_mode(MODE_CYCLE, 0);
-        uart_puts("ok\n");
+        out_puts("ok\n");
     }
     else if (strcmp(argv[0], "led") == 0 || strcmp(argv[0], "blink") == 0)
     {
         if (argc < 2 || !lookup_color(argv[1], &val))
         {
-            uart_puts("err: usage: ");
-            uart_puts(argv[0]);
-            uart_puts(" <red|green|blue|yellow|cyan|magenta|white|off>\n");
+            out_puts("err: usage: ");
+            out_puts(argv[0]);
+            out_puts(" <red|green|blue|yellow|cyan|magenta|white|off>\n");
             return;
         }
         set_mode(argv[0][0] == 'l' ? MODE_SOLID : MODE_BLINK, val);
-        uart_puts("ok\n");
+        out_puts("ok\n");
     }
     else if ((ch = channel_cmd(argv[0], "pwm")) != NULL)
     {
@@ -907,68 +1097,98 @@ static void run_command(char *line)
     {
         if (argc < 2 || !parse_u32(argv[1], &val) || val < 10U || val > 10000U)
         {
-            uart_puts("err: usage: rate <10..10000>\n");
+            out_puts("err: usage: rate <10..10000>\n");
             return;
         }
         g_period_ms = val;
-        uart_puts("ok\n");
+        out_puts("ok\n");
     }
     else if (strcmp(argv[0], "reset") == 0)
     {
-        uart_puts("resetting\n");
-        while (!(LPUART0->STAT & LPUART_STAT_TC_MASK))
-        {
-        }
+        out_puts("resetting\n");
+        shell_flush(g_out);
         NVIC_SystemReset();
     }
     else
     {
-        uart_puts("err: unknown command '");
-        uart_puts(argv[0]);
-        uart_puts("', try 'help'\n");
+        out_puts("err: unknown command '");
+        out_puts(argv[0]);
+        out_puts("', try 'help'\n");
     }
 }
 
 /* Line editor: echo, backspace, CR or LF terminates. */
-static void shell_poll(void)
+static void shell_poll(shell_t *sh)
 {
-    static char line[LINE_MAX];
-    static uint32_t len;
-    static char prev;
     char c;
 
-    while (uart_getc(&c))
+    g_out = sh;
+    while (shell_getc(sh, &c))
     {
         if (c == '\r' || c == '\n')
         {
-            bool crlf = (c == '\n' && prev == '\r');
-            prev      = c;
+            bool crlf = (c == '\n' && sh->prev == '\r');
+            sh->prev  = c;
             if (crlf)
             {
                 continue; /* second half of CRLF */
             }
-            uart_puts("\n");
-            line[len] = '\0';
-            run_command(line);
-            len = 0;
-            uart_puts("> ");
+            out_puts("\n");
+            sh->line[sh->len] = '\0';
+            run_command(sh->line);
+            sh->len = 0;
+            out_puts("> ");
             continue;
         }
-        prev = c;
+        sh->prev = c;
 
         if (c == '\b' || c == 0x7F)
         {
-            if (len > 0U)
+            if (sh->len > 0U)
             {
-                len--;
-                uart_puts("\b \b");
+                sh->len--;
+                out_puts("\b \b");
             }
         }
-        else if (c >= ' ' && c <= '~' && len < LINE_MAX - 1U)
+        else if (c >= ' ' && c <= '~' && sh->len < LINE_MAX - 1U)
         {
-            line[len++] = c;
-            uart_putc(c);
+            sh->line[sh->len++] = c;
+            out_putc(c);
         }
+    }
+}
+
+static void shell_banner(shell_t *sh)
+{
+    g_out = sh;
+    out_puts("\nFRDM-MCXA153 shell ready. Type 'help'.\n");
+    out_puts(g_restored ? "settings: restored from flash\n" : "settings: defaults\n");
+    out_puts("last reset: ");
+    out_reset_cause(g_reset_srs);
+    out_puts("\n> ");
+}
+
+/* USB CDC shell: greet each time a terminal opens the port. */
+static void usb_shell_poll(void)
+{
+    if (g_usb_greet)
+    {
+        g_usb_greet     = false;
+        g_usb_shell.len = 0U;
+        tud_cdc_read_flush(); /* drop anything typed before the terminal opened */
+        shell_banner(&g_usb_shell);
+    }
+    shell_poll(&g_usb_shell);
+    tud_cdc_write_flush();
+}
+
+void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
+{
+    (void)itf;
+    (void)rts;
+    if (dtr)
+    {
+        g_usb_greet = true;
     }
 }
 
@@ -1001,6 +1221,7 @@ static void leds_poll(void)
 
 int main(void)
 {
+    g_reset_srs = CMC->SRS;
     clocks_init();
     leds_init();
     uart_init();
@@ -1008,19 +1229,22 @@ int main(void)
     SystemCoreClock = core_clock_hz();
     SysTick_Config(SystemCoreClock / 1000U);
 
-    bool restored = apply_saved();
-    if (!restored)
+    g_restored = apply_saved();
+    if (!g_restored)
     {
         apply_defaults();
     }
-    uart_puts("\nFRDM-MCXA153 shell ready. Type 'help'.\n");
-    uart_puts(restored ? "settings: restored from flash\n" : "settings: defaults\n");
-    uart_puts("> ");
+    shell_banner(&g_uart_shell);
+
+    tusb_rhport_init_t usb_init = {.role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_FULL};
+    tusb_init(0, &usb_init);
 
     for (;;)
     {
-        shell_poll();
+        tud_task();
+        shell_poll(&g_uart_shell);
+        usb_shell_poll();
         leds_poll();
-        __WFI(); /* woken by SysTick or UART RX */
+        __WFI(); /* woken by SysTick, UART RX or USB */
     }
 }
