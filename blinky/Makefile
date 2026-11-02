@@ -6,8 +6,14 @@ OBJCOPY := $(CROSS)objcopy
 SIZE    := $(CROSS)size
 PYOCD   ?= $(HOME)/.venvs/pyocd/bin/pyocd
 
-SRCS := main.c settings.c device/system_MCXA153.c device/startup_MCXA153.S
-INCS := -I. -Idevice -Idevice/periph -Idevice/drivers -Icmsis
+TUSB := lib/tinyusb/src
+TUSB_SRCS := $(TUSB)/tusb.c $(TUSB)/common/tusb_fifo.c $(TUSB)/device/usbd.c \
+             $(TUSB)/class/cdc/cdc_device.c \
+             $(TUSB)/portable/chipidea/ci_fs/dcd_ci_fs.c
+
+SRCS := main.c settings.c usb_descriptors.c device/system_MCXA153.c device/startup_MCXA153.S \
+        $(TUSB_SRCS)
+INCS := -I. -Idevice -Idevice/periph -Idevice/drivers -Icmsis -I$(TUSB)
 LDSCRIPT := device/MCXA153_flash.ld
 
 CPU    := -mcpu=cortex-m33+nodsp -mthumb -mfloat-abi=soft
