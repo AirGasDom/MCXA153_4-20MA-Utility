@@ -1,7 +1,7 @@
 # FRDM-MCXA153 blinky + serial shell
 
 Bare-metal firmware for the NXP FRDM-MCXA153 board: RGB LED control, two
-serial command shells (MCU-Link UART and native USB), two independent PWM outputs (P1_4 on J1-2 and P1_3), and
+serial command shells (MCU-Link UART and native USB), two independent PWM outputs (P1_4 on J1-2 and P1_3 on Pmod J7-1), and
 settings saved to flash.
 
 Used for BAM 1 v5 regression (CY26 Q4 Goal 2): each PWM output drives a
@@ -112,11 +112,11 @@ There are two channels, each wired to its own module exactly as below:
 | Channel | PWM pin | Commands |
 |---|---|---|
 | 1 | P1_4 (J1-2), CTIMER1 match 2 | `pwm`, `ma`, `cal` |
-| 2 | P1_3, CTIMER1 match 1 | `pwm2`, `ma2`, `cal2` |
+| 2 | P1_3 (Pmod J7-1), CTIMER1 match 1 | `pwm2`, `ma2`, `cal2` |
 
-P1_3 is on the Arduino-style header (it is the LPSPI0 PCS0 pin); check the
-FRDM-MCXA153 schematic or silkscreen for the exact header position. Both
-channels share the 12 kHz period, but each has its own duty cycle.
+P1_3 is not on the Arduino header. It is pin 1 (CS) of the Pmod header J7,
+and is also the CS pin (pin 3) of the mikroBUS socket's right-hand row
+(it is the LPSPI0 PCS0 pin). Both channels share the 12 kHz period, but each has its own duty cycle.
 
 Each module needs its own RC filter and its own calibration (steps below,
 using `ma2`/`cal2` for channel 2). One 12-24 V supply can power both. The
@@ -166,7 +166,7 @@ Resolution is about 16 µA per count (1000 counts over 4-20 mA).
 - Commands: connect **MCU USB (J8)** to the Pi. Flashing: connect the
   USB-C port labelled **MCU-Link** (J15).
 - RGB LED: red P3_12, green P3_13, blue P3_0 (active low).
-- PWM: channel 1 on P1_4 (header J1 pin 2), channel 2 on P1_3, 12 kHz,
+- PWM: channel 1 on P1_4 (header J1 pin 2), channel 2 on P1_3 (Pmod J7 pin 1), 12 kHz,
   1000 counts per period. Add an RC low-pass filter (for example 10 kΩ +
   1 µF) to each to get 0 to 3.3 V.
 - Core clock: 48 MHz (FIRC, as left by the boot ROM). USB0 runs from the
